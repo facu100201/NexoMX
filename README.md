@@ -240,6 +240,8 @@ Not the number of screens. The first stage is done when:
 - Decisions that change the plan are recorded as ADRs in `docs/decisions/`.
 - If an environment limitation blocks something, it gets documented here instead of being worked around silently.
 
+- NOTE: Added an MIT LICENSE file. The repo only has the README on purpose since the form says not to start before approval. Session 1 sets up the TypeScript/Node monorepo with PostgreSQL and SQLite, so the stack will be in the code from the first commit.
+
 ## Data sources
 
 This stage works with fixtures. Before connecting any real source, verify its endpoints, schema, units, frequency, license and terms of use against its current documentation.
