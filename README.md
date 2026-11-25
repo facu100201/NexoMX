@@ -4,7 +4,7 @@
 
 A platform that connects official hazard information in Mexico with what citizens and civil protection teams need to do in a specific place: understand local risk, get prepared, report damage and coordinate the response.
 
-> **Status:** definition. There is no code yet. This README sets the scope, the domain rules and the session plan for the first stage.
+> **Status:** definition. There is no code yet: the repo stays at this README and the MIT license until the project is approved. This README sets the scope, the domain rules and the session plan for the first stage.
 
 ---
 
@@ -39,17 +39,16 @@ The project started as **NexoMX Edge**: nodes that keep public weather data clos
 
 ## First stage: one complete vertical slice
 
-One municipality, one hazard (heavy rain and flooding) and one end-to-end flow:
+One municipality, one hazard (heavy rain and flooding) and one end-to-end flow. The hard part goes first: Edge nodes that keep working while cut off, and a simulator that proves it.
 
-1. Ingest weather data from a fixture faithful to the SMN schema.
-2. Normalize and store every record with provenance and timestamps.
-3. Expose an API with an OpenAPI contract.
-4. Query the situation by municipality and time window.
-5. Show a web view of the local situation.
-6. Create citizen reports.
-7. Review reports and change their status from an operator panel.
-8. Audit every transition.
-9. Serve already-synced data from an Edge node with SQLite during a simulated outage of the origin.
+1. Run origin, Edge nodes, clients and failures inside a seeded, deterministic simulator.
+2. Accept citizen reports and operator transitions on an Edge node while it's offline, as events with hybrid logical clocks.
+3. Merge those events on reconnect with domain rules and send real conflicts to an operator queue.
+4. Check convergence and the invariants below under random kills, partitions, packet loss and clock skew.
+5. Ingest weather data from a fixture faithful to the SMN schema, with provenance, timestamps and supersede.
+6. Expose an API with an OpenAPI contract, including as-of queries.
+7. Show a web view of the local situation and a report form.
+8. Review reports and change their status from an operator panel, with every transition audited.
 
 **Out of scope for now:** national coverage, more hazards, in-house prediction, integration with official alerting, real message delivery and a pilot with authorities.
 
@@ -90,8 +89,8 @@ Protocols  Reports  Incidents
      v               v
 Citizen view    Operator panel
 
-Edge: sync, local storage and serving of
-previously received information.
+Edge: offline reads and writes, an event log
+with hybrid logical clocks, and merge on reconnect.
 ```
 
 It starts as a **modular monolith** with clear domain boundaries. No microservices until there is an operational reason for them. Business rules don't live in HTTP handlers.
@@ -119,21 +118,32 @@ Received → Triaged → UnderReview → Verified → Assigned → InProgress �
 
 ### Edge
 
-- Incremental, idempotent sync, with a version or sequence number per record.
-- Never overwrites newer data with an older version.
-- Stores in SQLite and serves over local HTTP.
-- Applies expiry policies and exposes when each record was synced.
+Outages hit hardest when reports matter most, so an Edge node keeps working while it's cut off: it serves what it already has and keeps taking new reports and operator transitions.
 
-**Limit:** a disconnected node can only serve what it already received. It can't get new data during a full outage, and it can't alert devices without an independent channel.
+- Stores in SQLite and serves over local HTTP.
+- Every write is an event in a local log, stamped with a hybrid logical clock (HLC) and the node id.
+- Reports carry a client UUID and an idempotency key, so merging them is a union with no duplicates.
+- On reconnect the origin replays transitions in HLC order. The first valid one wins. A transition whose previous state no longer matches is rejected, recorded in the audit log as a conflict and sent to the operator queue. Nothing is resolved silently.
+- Forecasts are monotonic: the record with the latest issue time (model run, then `published_at`) is the current one. Older versions are kept only for as-of queries and are never shown as current. If the newest one is past `valid_until`, it's shown as stale; it never falls back to an older one.
+- Sync is incremental and idempotent, with a version per record, and exposes when each record was synced.
+
+**Limit:** a disconnected node can only serve what it already received. It can't get new official data during a full outage, and it can't alert devices without an independent channel.
 
 | Scenario | Expected behavior |
 | --- | --- |
 | Normal connectivity | Periodic sync and local serving |
 | Slow origin | Answer from valid cache and flag its age |
-| Origin down | Serve synced data that is still valid |
+| Origin down | Serve synced data that is still valid and keep accepting reports and transitions |
 | Intermittent connectivity | Retries with backoff and idempotent sync |
-| Recovery | Detect changes and sync without duplicates |
+| Recovery | Merge offline events without duplicates; stale transitions go to the conflict queue |
+| Older forecast arrives late | Store it for as-of queries; keep serving the newest one |
 | Expired data | Show it as stale or stop presenting it as current |
+
+### Simulator
+
+Origin, Edge nodes, clients, links and failures all run in one process on a virtual clock. A seed controls node and origin kills, partitions, packet loss, delay and clock skew, so the same seed replays the same run and any convergence bug can be reproduced. The node code is the same one that runs over real HTTP; only the transport changes.
+
+A checker runs after every simulated run and asserts the invariants: no lost or duplicated reports, no expired data served as current, the same state hash on every node after reconnecting, and every rejected transition present in the conflict queue.
 
 ## Development environment and stack
 
@@ -145,13 +155,13 @@ Available tools the project uses: Node 22 with npm, PostgreSQL, SQLite, Chrome a
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| API, ingestion worker and Edge agent | TypeScript on Node 22 | Fully available in the environment; it's my daily stack |
+| Simulator, API, ingestion worker and Edge agent | TypeScript on Node 22 | Fully available in the environment; it's my daily stack |
 | Web | React + TypeScript | Citizen view and operator panel in the browser |
 | Central database | PostgreSQL with the `pg` driver | Pure JavaScript driver, no native build |
 | Edge | SQLite with `node:sqlite` | Built into Node 22; avoids native drivers that need to download headers |
 | Migrations | Versioned SQL files and a small in-house runner | Reproducible and reviewable, no external tooling |
 | Contracts | OpenAPI | Document and validate the API |
-| Tests | Vitest, Playwright and disconnection tests | Unit, integration, end-to-end and resilience |
+| Tests | Vitest, Playwright and seeded chaos runs | Unit, integration, end-to-end and resilience |
 | Metrics | Prometheus-format endpoint per service | Tests read the metrics directly |
 
 **Few dependencies, stable versions.** Before adding a package, check that it's in the mirror. If a version is missing, loosen the range instead of forcing it.
@@ -163,7 +173,7 @@ Available tools the project uses: Node 22 with npm, PostgreSQL, SQLite, Chrome a
 | **Go with the standard library only, no modules.** No PostgreSQL or SQLite driver. | The original plan was Go for the backend and Edge. It moves to TypeScript. If Go modules become available, the Edge agent is the first candidate to move back to Go. |
 | **PostGIS is not guaranteed.** | Geometries stored as GeoJSON; containment and distance computed in the application. Enough for one municipality. |
 | **No internet.** No live SMN API and no map tiles. | Fixtures faithful to the SMN schema; municipal boundaries as local GeoJSON; map without a basemap. |
-| **No Docker.** | Local PostgreSQL started by a script in the repo. Outages are simulated by stopping the origin process or with an in-house proxy that delays or drops requests. |
+| **No Docker or network tools.** | The simulator runs in-process on a virtual clock, so nodes, links and failures need no containers. Over real HTTP, outages are simulated by stopping the origin process or with an in-house proxy that delays or drops requests. Local PostgreSQL is started by a script in the repo. |
 | **No Prometheus or Grafana server.** | Each service exposes `/metrics`; tests read and validate them. |
 
 ## Proposed repository structure
@@ -175,10 +185,12 @@ nexomx/
 ├── apps/
 │   ├── api/          # HTTP API: situation, reports, incidents
 │   ├── worker/       # Ingestion and normalization
-│   ├── edge/         # Edge agent: sync, SQLite and local API
+│   ├── edge/         # Edge agent: SQLite, local API, offline writes
 │   └── web/          # Citizen view and operator panel
 ├── packages/
 │   ├── domain/       # Domain rules: states, permissions, validity
+│   ├── sync/         # Event log, HLC, merge and conflict rules
+│   ├── sim/          # Virtual clock, seeded faults, transport, checker
 │   └── db/           # SQL migrations and PostgreSQL access
 ├── fixtures/
 │   ├── smn/          # Responses faithful to the SMN schema, valid and invalid
@@ -190,47 +202,54 @@ nexomx/
 │   └── architecture/
 └── tests/
     ├── e2e/          # Playwright
-    └── resilience/   # Outages, intermittency and recovery
+    └── chaos/        # Seeded runs: outages, partitions, skew and recovery
 ```
 
 ## Session plan
 
-Each session ends with passing tests and a concrete way to check the result.
+Each session ends with passing tests and a concrete way to check the result. The hard part goes first; the app sits on top of it.
 
 | # | Session | Checked by |
 | --- | --- | --- |
-| 1 | Monorepo structure, PostgreSQL startup script, schema and migrations, provenance model and SMN fixtures | Migrations run from scratch twice without errors; fixtures load and validate |
-| 2 | Ingestion adapter: validation, normalization, idempotent upserts and retries | Ingesting the same fixture twice doesn't duplicate records; an invalid fixture is rejected with a clear error |
-| 3 | Public API with OpenAPI: situation and forecasts by municipality, validity fields, pagination and consistent errors | Responses include source and validity; expired data comes back marked as stale |
-| 4 | Auth and RBAC (citizen, operator, admin); report submission with validation, idempotency keys and rate limits | A citizen can't change states; resending the same report with the same key doesn't duplicate it |
-| 5 | Report state machine, audit log and duplicate detection | An invalid transition is rejected; every valid transition leaves an audit record |
-| 6 | Citizen view: situation page, report form and labels by information type | Playwright test: a citizen sees the situation with source and time, and submits a report |
-| 7 | Operator panel: review queue, map with local GeoJSON, transitions and timeline | Playwright test: an operator takes a report from received to closed |
-| 8 | Edge agent: incremental sync with versions, SQLite, local API and expiry | Older data doesn't overwrite newer data; the node answers from SQLite |
-| 9 | Resilience: origin down, intermittent connection, recovery, expired data, metrics and a load test | During the outage the node serves every valid record; on reconnect it syncs without duplicates |
-| 10 | ADRs, diagrams, documentation and a reproducible demo | Someone new can run the demo following only the README |
+| 1 | Monorepo structure, simulator and transport: virtual clock, seeded loss, delay, skew and kills, same node code over HTTP | The same seed produces the same event trace twice; a node killed mid-run restarts from its SQLite state |
+| 2 | Event log and HLC on the Edge node: offline reports and transitions, idempotency keys, versioned records | Resending the same report with the same key doesn't duplicate it; HLC order holds under ±5 min skew |
+| 3 | Merge and conflicts: report state machine on replay, precondition rejects, forecast supersede, conflict queue, audit log | A stale transition is rejected and lands in the conflict queue with an audit record; an older forecast never replaces a newer one |
+| 4 | Checker and chaos run: invariants, state hash and the numbers in [What success looks like](#what-success-looks-like) | The 30-minute run passes every target; the same seed gives the same state hash and conflict list twice in a row |
+| 5 | PostgreSQL schema and migrations, provenance model, SMN fixtures and ingestion with validation and idempotent upserts | Migrations run from scratch twice; ingesting the same fixture twice doesn't duplicate records; an invalid fixture is rejected |
+| 6 | Public API with OpenAPI: situation by municipality, validity fields, as-of queries, pagination and consistent errors | Responses include source and validity; expired data comes back as stale; an as-of query returns what was current at that time |
+| 7 | Auth and RBAC (citizen, operator, admin) on the origin and the Edge node, rate limits | A citizen can't change states, online or offline |
+| 8 | Citizen view: situation page, report form and labels by information type | Playwright test: a citizen sees the situation with source and time, and submits a report while the node is offline |
+| 9 | Operator panel: review queue, conflict queue, map with local GeoJSON, transitions and timeline | Playwright test: an operator takes a report from received to closed and resolves a conflict |
+| 10 | ADRs, diagrams, metrics, documentation and a reproducible demo | Someone new can run the chaos run and the demo following only the README |
 
 **Milestones:**
 
-- **Milestone 1 (sessions 1–3):** fixture data flows all the way to the API with provenance and validity.
-- **Milestone 2 (sessions 4–7):** the report workflow works end to end with permissions and audit.
-- **Milestone 3 (sessions 8–10):** Edge survives a simulated outage and the demo is reproducible.
+- **Milestone 1 (sessions 1–4):** Edge nodes take writes offline, merge on reconnect and pass the seeded chaos run.
+- **Milestone 2 (sessions 5–7):** fixture data flows to the API with provenance, validity and as-of queries, with permissions.
+- **Milestone 3 (sessions 8–10):** both UIs work on top, including offline, and the demo is reproducible.
 
 ## What success looks like
 
-Not the number of screens. The first stage is done when:
+Not the number of screens. The core is done when a seeded chaos run passes:
+
+- **Setup:** 1 origin and 5 Edge nodes, 30-minute runs with random node and origin kills, partitions, 20% packet loss and ±5 min clock skew, while 500 reports and 2,000 transitions go in.
+- **0** lost or duplicated reports.
+- **0** expired records served as current.
+- **100%** of still-valid records served during outages.
+- Every node reaches the **same state hash within 60 s** of reconnecting.
+- Every rejected transition shows up in the conflict queue and the audit log.
+- Edge reads under **50 ms at p95**.
+- The **same seed replays to the same state hash and the same conflict list, twice in a row**, so any failure can be debugged.
+
+The first stage is done when, on top of that:
 
 - Ingestion is repeatable and rejects invalid data.
-- The API returns data with its source, validity and coverage.
-- A citizen submits a report and an operator takes it to closed, with an audit trail.
+- The API returns data with its source, validity and coverage, and answers as-of queries.
+- A citizen submits a report, online or offline, and an operator takes it to closed with an audit trail.
 - Wrong permissions are rejected.
 - The system tells official data, its own analysis and unverified reports apart.
-- The Edge node serves every synced, still-valid record during an outage, and syncs without duplicates when it reconnects.
-- Tests catch network failures, invalid data, duplicates and wrong permissions.
 
-**Metrics:** data freshness, API latency (p50/p95/p99), report processing time, share of valid records available during the outage, and consistency after sync.
-
-**Experimental targets** (test goals, not results): serve 100% of previously stored, still-valid records during an origin outage, and 100% consistency on the test set after sync.
+These numbers are test goals, not results.
 
 ## How I work with the assistant in this repo
 
@@ -239,8 +258,6 @@ Not the number of screens. The first stage is done when:
 - Every new feature comes with its tests, and they run before anything is called done.
 - Decisions that change the plan are recorded as ADRs in `docs/decisions/`.
 - If an environment limitation blocks something, it gets documented here instead of being worked around silently.
-
-- NOTE: Added an MIT LICENSE file. The repo only has the README on purpose since the form says not to start before approval. Session 1 sets up the TypeScript/Node monorepo with PostgreSQL and SQLite, so the stack will be in the code from the first commit.
 
 ## Data sources
 
